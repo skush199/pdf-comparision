@@ -13,3 +13,6 @@ __pycache__/
 # outputs
 *.json
 *.txt
+
+# allow requirements file
+!requirements.txt
