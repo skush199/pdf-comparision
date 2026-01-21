@@ -1,1 +1,15 @@
-.pdf
+# virtual env
+venv/
+
+# env files
+.env
+
+# cache
+__pycache__/
+
+# PDFs (optional – if large/private)
+*.pdf
+
+# outputs
+*.json
+*.txt
