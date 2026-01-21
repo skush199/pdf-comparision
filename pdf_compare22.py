@@ -889,16 +889,22 @@ def main(
     Args:
         pdf1_path: Path to first (old/baseline) PDF
         pdf2_path: Path to second (new) PDF
-        output_path: Optional path for highlighted output PDF
+        output_path: Optional path for highlighted output PDF.
+                    If None, auto-generates in the same folder as pdf1.
         use_ocr: Whether to use OCR for non-selectable text
         user_type: "org" or "byok" for credential handling
     
     Returns:
         Comparison report as a dictionary
     """
-    # Set default output path
+    # Set default output path - save in the same directory as the first PDF
     if output_path is None:
-        output_path = "highlighted_diff.pdf"
+        input_dir = Path(pdf1_path).parent
+        output_path = str(input_dir / "comparison_result.pdf")
+    elif not os.path.isabs(output_path):
+        # If relative path provided, make it relative to the input PDF's directory
+        input_dir = Path(pdf1_path).parent
+        output_path = str(input_dir / output_path)
     
     # Validate input files exist
     if not Path(pdf1_path).exists():
@@ -946,6 +952,12 @@ def main(
     
     # Step 4: Generate report
     report = generate_report(differences, output_path, ocr_pages1, ocr_pages2)
+    
+    # Save JSON report to the same folder as output PDF
+    json_report_path = str(Path(output_path).with_suffix('.json'))
+    with open(json_report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"JSON report saved to: {json_report_path}")
     
     # Print report
     print("=" * 60)
