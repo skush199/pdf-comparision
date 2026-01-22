@@ -52,6 +52,7 @@ class NumberMatch:
     rect: fitz.Rect  # Bounding box coordinates
     line_number: int  # Approximate line number on page
     source: str = "text"  # "text" or "ocr" to track extraction source
+    context: str = ""  # Nearby text label describing the number
 
 
 @dataclass
@@ -64,6 +65,7 @@ class Difference:
     old_rect: fitz.Rect
     new_rect: fitz.Rect
     source: str = "text"  # "text" or "ocr"
+    context: str = ""  # Label/field name for this value
 
 
 class GoogleVisionOCRProcessor:
@@ -364,6 +366,26 @@ def extract_numbers_from_ocr_words(
     line_counter = base_line
     last_y = -1
     
+    # First, identify all non-numeric text with their positions (for context lookup)
+    text_labels = []  # List of (y_center, x_center, x1, text)
+    for word_data in sorted_words:
+        word_text = word_data['text'].strip()
+        norm_bbox = word_data['bbox']
+        
+        # Check if this is NOT primarily numeric
+        clean_text = word_text.replace('¥', '').replace('$', '').replace('€', '').replace('£', '').strip()
+        if clean_text and not number_pattern.match(clean_text) and not date_pattern.match(clean_text):
+            # Calculate Y center and X positions (normalized)
+            y_center = (norm_bbox[1] + norm_bbox[3]) / 2
+            x_center = (norm_bbox[0] + norm_bbox[2]) / 2
+            x1 = norm_bbox[2]  # Right edge of the text
+            text_labels.append({
+                'y_center': y_center,
+                'x_center': x_center,
+                'x1': x1,
+                'text': word_text
+            })
+    
     for word_data in sorted_words:  # Use sorted words for consistent ordering
         word_text = word_data['text']
         norm_bbox = word_data['bbox']  # (x0, y0, x1, y1) normalized 0-1
@@ -388,6 +410,34 @@ def extract_numbers_from_ocr_words(
         pdf_y1 = offset_y + (norm_bbox[3] * region_height)
         num_rect = fitz.Rect(pdf_x0, pdf_y0, pdf_x1, pdf_y1)
         
+        # Calculate Y center for context lookup
+        num_y_center = (norm_bbox[1] + norm_bbox[3]) / 2
+        num_x0 = norm_bbox[0]
+        
+        # Find context: text labels on the same row to the LEFT of this position
+        def find_context():
+            context_parts = []
+            y_tolerance = 0.02  # ~2% of page height
+            
+            for label in text_labels:
+                # Same row check
+                if abs(label['y_center'] - num_y_center) < y_tolerance:
+                    # Must be to the left of the number
+                    if label['x1'] < num_x0:
+                        context_parts.append((label['x_center'], label['text']))
+            
+            # Sort by x position (leftmost first) and take rightmost 3
+            context_parts.sort(key=lambda x: x[0], reverse=True)
+            context = ""
+            for _, txt in context_parts[:3]:
+                if txt not in context:
+                    context = txt + " " + context if context else txt
+            
+            context = context.strip()
+            if len(context) > 50:
+                context = "..." + context[-47:]
+            return context
+        
         # Check if this is a date pattern (e.g., 2026-01-21)
         if date_pattern.match(clean_text):
             # For dates, store the full date for comparison
@@ -401,7 +451,8 @@ def extract_numbers_from_ocr_words(
                         page=page_num,
                         rect=num_rect,
                         line_number=line_counter,
-                        source="ocr"
+                        source="ocr",
+                        context=find_context()
                     ))
                 except ValueError:
                     pass
@@ -421,7 +472,8 @@ def extract_numbers_from_ocr_words(
                         page=page_num,
                         rect=num_rect,
                         line_number=line_counter,
-                        source="ocr"
+                        source="ocr",
+                        context=find_context()
                     ))
             except ValueError:
                 pass
@@ -444,7 +496,8 @@ def extract_numbers_from_ocr_words(
                     page=page_num,
                     rect=num_rect,
                     line_number=line_counter,
-                    source="ocr"
+                    source="ocr",
+                    context=find_context()
                 ))
             except ValueError:
                 pass
@@ -472,8 +525,31 @@ def extract_numbers_from_page(page: fitz.Page, page_num: int) -> Tuple[List[Numb
     # Pattern to match numbers: integers, decimals, negative numbers, currency
     number_pattern = re.compile(r'-?[\d,]+\.?\d*')
     
+    # First pass: collect ALL text spans with their positions for context lookup
+    all_text_spans = []  # List of (text, y_center, x0, x1, y0, y1)
+    
+    for block in blocks:
+        if block["type"] != 0:  # Skip non-text blocks
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span["text"].strip()
+                if text and "(cid:" not in text.lower():
+                    has_selectable_text = True
+                    bbox = span["bbox"]
+                    y_center = (bbox[1] + bbox[3]) / 2
+                    all_text_spans.append({
+                        "text": text,
+                        "y_center": y_center,
+                        "x0": bbox[0],
+                        "x1": bbox[2],
+                        "y0": bbox[1],
+                        "y1": bbox[3]
+                    })
+    
     line_counter = 0
     
+    # Second pass: extract numbers and find their context
     for block in blocks:
         if block["type"] != 0:  # Skip non-text blocks (images, etc.)
             continue
@@ -483,12 +559,8 @@ def extract_numbers_from_page(page: fitz.Page, page_num: int) -> Tuple[List[Numb
             
             for span in line.get("spans", []):
                 text = span["text"]
-                
-                # Check if we have real selectable text
-                if text.strip() and "(cid:" not in text.lower():
-                    has_selectable_text = True
-                
                 span_rect = fitz.Rect(span["bbox"])
+                span_y_center = (span_rect.y0 + span_rect.y1) / 2
                 
                 # Find all numbers in this text span
                 for match in number_pattern.finditer(text):
@@ -517,16 +589,43 @@ def extract_numbers_from_page(page: fitz.Page, page_num: int) -> Tuple[List[Numb
                         span_rect.y1
                     )
                     
+                    # Find context: look for text spans on the same row (similar Y) but to the LEFT
+                    context_parts = []
+                    y_tolerance = 10  # pixels tolerance for same-row detection
+                    
+                    for ts in all_text_spans:
+                        # Same row check: Y center within tolerance
+                        if abs(ts["y_center"] - span_y_center) < y_tolerance:
+                            # Must be to the left of the number
+                            if ts["x1"] < start_x:
+                                # Skip if it's a pure number
+                                if not number_pattern.fullmatch(ts["text"]):
+                                    context_parts.append((ts["x0"], ts["text"]))
+                    
+                    # Sort by x position and take the rightmost non-number text
+                    context_parts.sort(key=lambda x: x[0], reverse=True)
+                    context = ""
+                    for _, ctx_text in context_parts[:3]:  # Take up to 3 closest labels
+                        if ctx_text not in context:
+                            context = ctx_text + " " + context if context else ctx_text
+                    
+                    # Limit context length
+                    context = context.strip()
+                    if len(context) > 50:
+                        context = "..." + context[-47:]
+                    
                     numbers.append(NumberMatch(
                         value=num_str,
                         numeric_value=numeric_val,
                         page=page_num,
                         rect=num_rect,
                         line_number=line_counter,
-                        source="text"
+                        source="text",
+                        context=context
                     ))
     
     return numbers, has_selectable_text
+
 
 
 def extract_all_numbers(
@@ -720,77 +819,123 @@ def extract_all_numbers(
 def compare_numbers(
     numbers1: List[NumberMatch], 
     numbers2: List[NumberMatch],
-    tolerance: float = 0.0001
+    tolerance: float = 0.0001,
+    y_tolerance: float = 15.0,  # Pixels for row matching
+    x_tolerance: float = 50.0   # Pixels for column matching
 ) -> List[Difference]:
     """
-    Compare two lists of numbers and find differences.
+    Compare two lists of numbers and find differences using row-based semantic matching.
     
-    Assumes both documents have the same structure, so numbers are aligned
-    by their position in the extraction sequence.
+    Instead of simple positional comparison, this uses:
+    1. Y-position grouping (numbers on the same row)
+    2. X-position matching within rows
+    3. Value-based fallback matching
     
     Args:
         numbers1: Numbers from first PDF (old/baseline)
         numbers2: Numbers from second PDF (new)
         tolerance: Floating point comparison tolerance
+        y_tolerance: Pixel tolerance for same-row detection
+        x_tolerance: Pixel tolerance for same-column detection
     
     Returns:
         List of Difference objects
     """
     differences = []
     
-    # Compare by position - assumes identical structure
-    min_len = min(len(numbers1), len(numbers2))
+    # Group numbers by page
+    def group_by_page(numbers):
+        pages = {}
+        for n in numbers:
+            if n.page not in pages:
+                pages[n.page] = []
+            pages[n.page].append(n)
+        return pages
     
-    for i in range(min_len):
-        n1 = numbers1[i]
-        n2 = numbers2[i]
+    pages1 = group_by_page(numbers1)
+    pages2 = group_by_page(numbers2)
+    
+    all_pages = set(pages1.keys()) | set(pages2.keys())
+    
+    for page_num in sorted(all_pages):
+        page_nums1 = pages1.get(page_num, [])
+        page_nums2 = pages2.get(page_num, [])
         
-        # Compare numeric values with tolerance
-        if abs(n1.numeric_value - n2.numeric_value) > tolerance:
-            # Determine source - if either used OCR, mark as OCR
-            source = "ocr" if (n1.source == "ocr" or n2.source == "ocr") else "text"
+        # Create a working copy of page2 numbers (to track matched)
+        unmatched2 = list(page_nums2)
+        matched1 = set()
+        
+        # Try to match each number from PDF1 with a number from PDF2
+        for n1 in page_nums1:
+            best_match = None
+            best_score = float('inf')
             
+            for n2 in unmatched2:
+                # Calculate matching score based on position
+                y_diff = abs(n1.rect.y0 - n2.rect.y0)
+                x_diff = abs(n1.rect.x0 - n2.rect.x0)
+                
+                # Check if on same row
+                if y_diff <= y_tolerance:
+                    # Check if in same column area
+                    if x_diff <= x_tolerance:
+                        # Score: prefer closer matches
+                        score = y_diff + x_diff
+                        if score < best_score:
+                            best_score = score
+                            best_match = n2
+            
+            if best_match:
+                # Found a match - check if values differ
+                if abs(n1.numeric_value - best_match.numeric_value) > tolerance:
+                    source = "ocr" if (n1.source == "ocr" or best_match.source == "ocr") else "text"
+                    context = n1.context if n1.context else best_match.context
+                    
+                    differences.append(Difference(
+                        page=n1.page,
+                        line=n1.line_number,
+                        old_value=n1.value,
+                        new_value=best_match.value,
+                        old_rect=n1.rect,
+                        new_rect=best_match.rect,
+                        source=source,
+                        context=context
+                    ))
+                
+                # Mark as matched
+                unmatched2.remove(best_match)
+                matched1.add(id(n1))
+            else:
+                # No match found - this number is only in PDF1
+                differences.append(Difference(
+                    page=n1.page,
+                    line=n1.line_number,
+                    old_value=n1.value,
+                    new_value="<missing>",
+                    old_rect=n1.rect,
+                    new_rect=fitz.Rect(),
+                    source=n1.source,
+                    context=n1.context
+                ))
+        
+        # Report remaining unmatched numbers from PDF2
+        for n2 in unmatched2:
             differences.append(Difference(
-                page=n1.page,
-                line=n1.line_number,
-                old_value=n1.value,
+                page=n2.page,
+                line=n2.line_number,
+                old_value="<missing>",
                 new_value=n2.value,
-                old_rect=n1.rect,
+                old_rect=fitz.Rect(),
                 new_rect=n2.rect,
-                source=source
+                source=n2.source,
+                context=n2.context
             ))
     
-    # Handle case where one PDF has more numbers than the other
-    if len(numbers1) != len(numbers2):
-        print(f"Warning: PDFs have different number counts ({len(numbers1)} vs {len(numbers2)})")
-        
-        # Report extra numbers in PDF1
-        for i in range(min_len, len(numbers1)):
-            n = numbers1[i]
-            differences.append(Difference(
-                page=n.page,
-                line=n.line_number,
-                old_value=n.value,
-                new_value="<missing>",
-                old_rect=n.rect,
-                new_rect=fitz.Rect(),
-                source=n.source
-            ))
-        
-        # Report extra numbers in PDF2
-        for i in range(min_len, len(numbers2)):
-            n = numbers2[i]
-            differences.append(Difference(
-                page=n.page,
-                line=n.line_number,
-                old_value="<missing>",
-                new_value=n.value,
-                old_rect=fitz.Rect(),
-                new_rect=n.rect,
-                source=n.source
-            ))
+    # Sort differences by page, then by line
+    differences.sort(key=lambda d: (d.page, d.line))
     
     return differences
+
 
 
 def create_highlighted_pdf(
@@ -938,13 +1083,17 @@ def generate_report(
     }
     
     for diff in differences:
-        report["differences"].append({
+        diff_entry = {
             "page": diff.page + 1,  # Convert to 1-indexed for readability
             "line": diff.line,
             "old": diff.old_value,
             "new": diff.new_value,
             "source": diff.source  # "text" or "ocr"
-        })
+        }
+        # Only include context if it's not empty
+        if diff.context:
+            diff_entry["context"] = diff.context
+        report["differences"].append(diff_entry)
     
     return report
 

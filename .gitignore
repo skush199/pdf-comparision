@@ -9,6 +9,7 @@ __pycache__/
 
 # PDFs (optional – if large/private)
 *.pdf
+*.xlsx
 
 # outputs
 *.json

@@ -1,7 +1,7 @@
 """
 LLM Equivalence Explainer
 
-Takes the JSON comparison result from pdf_compare.py and uses GPT-4o
+Takes the JSON comparison result from pdf_compare22.py and uses GPT-4o
 to generate a human-readable explanation suitable for business stakeholders.
 
 Usage:
@@ -12,7 +12,7 @@ Environment:
     OPENAI_API_KEY - Required OpenAI API key (can be set in .env file)
 
 Output:
-    equivalence_summary.txt - Human-readable explanation
+    <input_name>_summary.txt - Human-readable explanation (saved in same folder as input)
 """
 
 import os
@@ -41,6 +41,7 @@ You MUST NOT perform any numeric comparison or calculations.
 
 PROJECT CONTEXT:
 - Two PDF documents (old system vs new system) have already been compared using deterministic Python logic.
+- The comparison tool supports both selectable text and OCR (Optical Character Recognition) for scanned documents.
 - All numeric differences have already been detected and verified.
 - Your task is ONLY to explain the comparison result in clear, business-friendly language.
 - This output is used for client demos and sales presentations.
@@ -57,15 +58,29 @@ You will receive a JSON object with the following structure:
 {
   "status": "OK" | "Fail",
   "total_differences": <number>,
+  "ocr_used": {
+    "pdf1_ocr_pages": <number>,
+    "pdf2_ocr_pages": <number>
+  },
   "differences": [
     {
       "page": <page_number>,
       "line": <line_number>,
       "old": "<old_value>",
-      "new": "<new_value>"
+      "new": "<new_value>",
+      "source": "text" | "ocr",
+      "context": "<label or field name>"  // Optional - describes what the number represents
     }
-  ]
+  ],
+  "diff_pdf": "<path_to_highlighted_pdf>"
 }
+
+FIELD EXPLANATIONS:
+- "source": "text" means the value was extracted from selectable text in the PDF
+- "source": "ocr" means the value was extracted using OCR from scanned/image content
+- "ocr_used" shows how many pages required OCR processing in each document
+- "context": IMPORTANT - This is the field label or nearby text that describes what the number represents.
+  Use this to make your explanation more meaningful!
 
 YOUR TASK:
 Generate a clear explanation covering:
@@ -76,15 +91,24 @@ Generate a clear explanation covering:
 2. Summary of findings:
    - If status is "OK": confirm that all values match.
    - If status is "Fail": explain that differences were detected.
+   - Mention if OCR was used for any pages (this indicates scanned/image content).
 
 3. Difference explanation:
    - List the differences in simple bullet points.
+   - ALWAYS use the "context" field if available to name what changed.
+   - IMPORTANT: If the context is in Japanese or another non-English language, ALWAYS provide an English translation in parentheses.
+     Example: "仕様 策定 (Specification Formulation) changed from X to Y"
+     Example: "テック 小 計 (Tech Subtotal) changed from X to Y"
+     Example: "フロント エンド 開発 (Frontend Development) changed from X to Y"
+   - If context appears fragmented or unclear, interpret it as best as you can and provide an English explanation.
+   - If no context is available, describe the type of value if recognizable (date, amount, count, etc.).
    - Mention old value vs new value.
+   - Group related differences when possible.
    - Do NOT mention page or line numbers unless necessary.
 
 4. Business conclusion:
    - Explain what this means from a system validation perspective.
-   - Use wording suitable for payroll / insurance / enterprise systems.
+   - Use wording suitable for payroll / insurance / invoice / enterprise systems.
 
 OUTPUT FORMAT (STRICT):
 Return plain text only.
@@ -92,20 +116,23 @@ Do NOT return JSON.
 Do NOT include markdown.
 Do NOT include emojis.
 
-EXAMPLE OUTPUT STYLE:
+EXAMPLE OUTPUT STYLE (with context and translations):
 
 "Equivalence Check Result: FAILED
 
 The comparison between the legacy system output and the new system output identified multiple numerical differences.
 
 Key differences include:
-- Overtime hours increased from 12 to 15, resulting in a higher calculated amount.
-- Performance bonus value changed from 750.00 to 800.00.
-- Tax withholding amount changed from -425.00 to -430.00.
+- 仕様 策定 (Specification Formulation) changed from 10 hours to 2 hours.
+- フロント エンド 開発 (Frontend Development) changed from 20 hours to 1 hour.
+- テック 小 計 (Tech Subtotal) changed from 2,035,000 to 2,421,000.
+- 合計 (Total) changed from 2,238,500 to 2,663,100.
 
 Due to these discrepancies, the new system output is not equivalent to the legacy system output and requires further review before approval."
 
 Now generate the explanation based strictly on the provided input JSON."""
+
+
 
 
 def generate_explanation(comparison_json: dict, api_key: str = None) -> str:
@@ -113,7 +140,7 @@ def generate_explanation(comparison_json: dict, api_key: str = None) -> str:
     Generate a human-readable explanation using GPT-4o.
     
     Args:
-        comparison_json: The JSON result from pdf_compare.py
+        comparison_json: The JSON result from pdf_compare22.py
         api_key: Optional OpenAI API key (uses env var if not provided)
     
     Returns:
@@ -164,8 +191,7 @@ def main():
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="equivalence_summary.txt",
-        help="Output file path (default: equivalence_summary.txt)"
+        help="Output file path (default: <input>_summary.txt in same folder)"
     )
     parser.add_argument(
         "--api-key",
@@ -183,15 +209,26 @@ def main():
         sys.exit(1)
     
     # Load comparison JSON
+    input_path = None
     if args.json:
         comparison_data = json.loads(args.json)
     elif args.input:
-        with open(args.input, "r", encoding="utf-8") as f:
+        input_path = Path(args.input)
+        with open(input_path, "r", encoding="utf-8") as f:
             comparison_data = json.load(f)
     else:
         print("Error: Provide JSON file path or use --json for inline JSON")
         parser.print_help()
         sys.exit(1)
+    
+    # Determine output path
+    if args.output:
+        output_path = args.output
+    elif input_path:
+        # Save summary in same folder as input JSON
+        output_path = str(input_path.parent / f"{input_path.stem}_summary.txt")
+    else:
+        output_path = "equivalence_summary.txt"
     
     print("Generating explanation using GPT-4o...")
     print()
@@ -208,7 +245,7 @@ def main():
     print()
     
     # Save to file
-    save_explanation(explanation, args.output)
+    save_explanation(explanation, output_path)
     
     return explanation
 
