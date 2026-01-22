@@ -335,8 +335,25 @@ def extract_numbers_from_ocr_words(
     """
     numbers = []
     
-    # Pattern to match numbers in text
+    # IMPORTANT: Sort words by spatial position to ensure consistent ordering
+    # Sort by Y-position (top to bottom), then by X-position (left to right)
+    # Use a tolerance for Y to group words on the same line
+    def sort_key(word):
+        bbox = word['bbox']
+        y_center = (bbox[1] + bbox[3]) / 2
+        x_center = (bbox[0] + bbox[2]) / 2
+        # Round Y to group words on the same line (tolerance of 0.02 = ~2% of page height)
+        y_row = round(y_center, 2)
+        return (y_row, x_center)
+    
+    sorted_words = sorted(words_with_boxes, key=sort_key)
+    
+    # Patterns to match different types of numeric content:
+    # 1. Pure numbers with optional decimals and commas: 123, 1,234.56, -45.67
+    # 2. Date-like patterns: 2026-01-21, 01/21/2026
+    # 3. Reference numbers: 0142, 0001
     number_pattern = re.compile(r'^-?[\d,]+\.?\d*$')
+    date_pattern = re.compile(r'^\d{4}[-/]\d{2}[-/]\d{2}$|^\d{2}[-/]\d{2}[-/]\d{4}$')
     
     # Region dimensions and offset
     region_width = region_rect.width
@@ -347,30 +364,20 @@ def extract_numbers_from_ocr_words(
     line_counter = base_line
     last_y = -1
     
-    for word_data in words_with_boxes:
+    for word_data in sorted_words:  # Use sorted words for consistent ordering
         word_text = word_data['text']
         norm_bbox = word_data['bbox']  # (x0, y0, x1, y1) normalized 0-1
         
-        # Check if this word is a number
-        # Remove currency symbols and check
-        clean_text = word_text.replace('¥', '').replace('$', '').replace('€', '').strip()
+        # Remove currency symbols and clean the text
+        clean_text = word_text.replace('¥', '').replace('$', '').replace('€', '').replace('£', '').strip()
         
-        if not number_pattern.match(clean_text):
+        # Skip empty text
+        if not clean_text:
             continue
         
-        # Skip empty or invalid numbers
-        if not clean_text or clean_text in [',', '.', '-']:
-            continue
-        
-        # Parse the number
-        try:
-            numeric_val = float(clean_text.replace(',', ''))
-        except ValueError:
-            continue
-        
-        # Track line changes for line_number
+        # Track line changes for line_number based on Y position
         current_y = norm_bbox[1]
-        if last_y < 0 or abs(current_y - last_y) > 0.05:  # New line if Y changes significantly
+        if last_y < 0 or abs(current_y - last_y) > 0.03:
             line_counter += 1
             last_y = current_y
         
@@ -379,19 +386,71 @@ def extract_numbers_from_ocr_words(
         pdf_y0 = offset_y + (norm_bbox[1] * region_height)
         pdf_x1 = offset_x + (norm_bbox[2] * region_width)
         pdf_y1 = offset_y + (norm_bbox[3] * region_height)
-        
         num_rect = fitz.Rect(pdf_x0, pdf_y0, pdf_x1, pdf_y1)
         
-        numbers.append(NumberMatch(
-            value=clean_text,
-            numeric_value=numeric_val,
-            page=page_num,
-            rect=num_rect,
-            line_number=line_counter,
-            source="ocr"
-        ))
+        # Check if this is a date pattern (e.g., 2026-01-21)
+        if date_pattern.match(clean_text):
+            # For dates, store the full date for comparison
+            date_nums = re.findall(r'\d+', clean_text)
+            if len(date_nums) == 3:
+                try:
+                    numeric_val = float(''.join(date_nums))
+                    numbers.append(NumberMatch(
+                        value=clean_text,
+                        numeric_value=numeric_val,
+                        page=page_num,
+                        rect=num_rect,
+                        line_number=line_counter,
+                        source="ocr"
+                    ))
+                except ValueError:
+                    pass
+            continue
+        
+        # Check if this is a pure number (123, 1,234.56, -45.67)
+        if number_pattern.match(clean_text):
+            try:
+                numeric_val = float(clean_text.replace(',', ''))
+                # Skip all-zero patterns (likely OCR noise from Japanese/other text)
+                if clean_text.replace(',', '').replace('.', '').replace('0', '') == '':
+                    continue
+                if clean_text not in [',', '.', '-']:
+                    numbers.append(NumberMatch(
+                        value=clean_text,
+                        numeric_value=numeric_val,
+                        page=page_num,
+                        rect=num_rect,
+                        line_number=line_counter,
+                        source="ocr"
+                    ))
+            except ValueError:
+                pass
+            continue
+        
+        # For composite words (e.g., "INS-INV-2026-5101", "POL-EN-2026-884201")
+        # Extract ALL numeric parts and create entries for significant ones
+        num_parts = re.findall(r'\d+', clean_text)
+        for num_part in num_parts:
+            # Skip very short numbers (1-2 digits) from composite words as they're likely noise
+            # unless the word only has one number
+            if len(num_part) < 3 and len(num_parts) > 1:
+                continue
+            
+            try:
+                numeric_val = float(num_part)
+                numbers.append(NumberMatch(
+                    value=num_part,
+                    numeric_value=numeric_val,
+                    page=page_num,
+                    rect=num_rect,
+                    line_number=line_counter,
+                    source="ocr"
+                ))
+            except ValueError:
+                pass
     
     return numbers
+
 
 def extract_numbers_from_page(page: fitz.Page, page_num: int) -> Tuple[List[NumberMatch], bool]:
     """
@@ -530,7 +589,7 @@ def extract_all_numbers(
         
         # Perform OCR if needed and available
         if needs_ocr and ocr_processor and ocr_processor.is_available() and pdfplumber_doc:
-            print(f"  🔍 Performing OCR on page {page_num + 1}...")
+            print(f"  🔍 Performing full-page OCR on page {page_num + 1}...")
             
             try:
                 plumber_page = pdfplumber_doc.pages[page_num]
@@ -540,18 +599,32 @@ def extract_all_numbers(
                 img_bytes = io.BytesIO()
                 page_image.save(img_bytes, format="PNG")
                 
-                # Perform OCR
-                ocr_text = ocr_processor.ocr_image_bytes(img_bytes.getvalue())
+                # Get image dimensions for coordinate mapping
+                page_width_pts = float(plumber_page.width)
+                page_height_pts = float(plumber_page.height)
+                scale_factor = 300 / 72.0
+                img_width_px = int(page_width_pts * scale_factor)
+                img_height_px = int(page_height_pts * scale_factor)
                 
-                if ocr_text:
-                    print(f"  ✅ OCR extracted {len(ocr_text)} characters")
+                # Use word-level bounding boxes for accurate positioning
+                words_with_boxes = ocr_processor.ocr_image_with_boxes(
+                    img_bytes.getvalue(),
+                    img_width_px,
+                    img_height_px
+                )
+                
+                if words_with_boxes:
+                    print(f"  ✅ OCR extracted {len(words_with_boxes)} words")
                     
-                    # Extract numbers from OCR text
-                    ocr_numbers = extract_numbers_from_text(
-                        ocr_text, 
-                        page_num, 
-                        page.rect,
-                        source="ocr"
+                    # Create page rect for coordinate mapping
+                    page_rect = fitz.Rect(0, 0, page_width_pts, page_height_pts)
+                    
+                    # Extract numbers with accurate bounding boxes
+                    ocr_numbers = extract_numbers_from_ocr_words(
+                        words_with_boxes,
+                        page_num,
+                        page_rect,
+                        base_line=0
                     )
                     
                     if ocr_numbers:
@@ -560,7 +633,7 @@ def extract_all_numbers(
                         numbers = ocr_numbers
                         ocr_applied = True
                 else:
-                    print(f"  ⚠️ OCR returned no text")
+                    print(f"  ⚠️ OCR returned no words")
                     
             except Exception as e:
                 print(f"  ⚠️ OCR failed on page {page_num + 1}: {e}")
